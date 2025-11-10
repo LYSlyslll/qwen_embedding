@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-embed_error_types_local_vllm.py  (TXT 一行一条，鲁棒版)
+embed_error_types_local_vllm.py  (JSONL 输入，鲁棒版)
 
 输入:
-- /home/yanghao/math/extracted_errors.txt   # 每行一个错误类型，跳过空行/以#开头的注释
+- /home/yanghao/math/extracted_errors.txt   # 每行一个 JSON 对象，含字符串形式的 phrase 属性
 
 输出(原子写):
 - /home/yanghao/math/error_types_embeddings_3.jsonl
@@ -13,14 +13,13 @@ embed_error_types_local_vllm.py  (TXT 一行一条，鲁棒版)
 - 本地 vLLM + Qwen3-Embedding，eager 路径，显存友好；
 - MAX_NUM_SEQS 与 BATCH_SIZE 对齐；MAX_TOKENS 自动估计；
 - 批失败→单条回退；单条失败→零向量兜底(自动探维)；
-- NaN/Inf 自愈；仅做轻量清洗(空白/包裹引号/BOM/全角空格)；
+- NaN/Inf 自愈；解析 phrase 内部 JSON 并拼接两段文本的嵌入；
 - vLLM 输出结构解析更鲁棒；打印 vLLM 版本与最终维度。
 """
 
 import os
 import io
 import json
-import re
 from typing import Any, Iterable, List, Optional
 
 import torch
@@ -49,36 +48,61 @@ MAX_NUM_SEQS = max(1, BATCH_SIZE)
 MAX_TOKENS   = min(MAX_NUM_SEQS * MAX_LEN,
                    max(TOKENS_PER_GUESS, MAX_NUM_SEQS * TOKENS_PER_GUESS))
 
-# 可选：兼容“错误类型: xxx”/“error_type: xxx”/“类型: xxx”这种行首前缀
-_KEY_PAT = re.compile(r"^(错误类型|error_type|类型)\s*[:：=]\s*(.+?)\s*$", re.UNICODE)
+# ---------------- 读取 JSONL：一行一个 ----------------
+def _extract_phrase_payload(raw: str, lineno: int) -> Optional[dict]:
+    try:
+        outer = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[WARN] 第 {lineno} 行 JSON 解析失败：{e}，跳过。")
+        return None
 
-# ---------------- 读取 TXT：一行一个 ----------------
-def _sanitize_line(s: str) -> str:
-    # 去 BOM、全角空格，首尾空白
-    s = s.replace("\ufeff", "").replace("\u3000", " ").strip()
-    # 兼容“错误类型: xxx”这种前缀
-    m = _KEY_PAT.match(s)
-    if m:
-        s = m.group(2).strip()
-    # 去包裹引号（仅当整行被同一引号包裹）
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        s = s[1:-1].strip()
-    return s
+    phrase_payload = outer.get("phrase")
+    if not isinstance(phrase_payload, str):
+        print(f"[WARN] 第 {lineno} 行缺少字符串类型的 phrase 字段，跳过。")
+        return None
 
-def read_error_types_from_txt(path: str) -> List[str]:
+    try:
+        inner = json.loads(phrase_payload)
+    except json.JSONDecodeError as e:
+        print(f"[WARN] 第 {lineno} 行 phrase 字段内 JSON 解析失败：{e}，跳过。")
+        return None
+
+    phrase_text = inner.get("phrase")
+    if not isinstance(phrase_text, str):
+        print(f"[WARN] 第 {lineno} 行内层缺少字符串类型的 phrase，跳过。")
+        return None
+
+    keywords_val = inner.get("keywords")
+    keywords_text = ""
+    if isinstance(keywords_val, list) and keywords_val:
+        first = keywords_val[0]
+        if isinstance(first, str):
+            keywords_text = first
+    elif isinstance(keywords_val, str):
+        keywords_text = keywords_val
+
+    return {"phrase": phrase_text.strip(), "keywords": keywords_text.strip()}
+
+
+def read_error_types_from_txt(path: str) -> List[dict]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"输入文件不存在: {path}")
 
     seen = set()
-    uniq: List[str] = []
+    uniq: List[dict] = []
     with io.open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, 1):
-            s = _sanitize_line(line)
-            if not s or s.startswith("#"):
+            line = line.strip()
+            if not line:
                 continue
-            if s not in seen:
-                seen.add(s)
-                uniq.append(s)
+            payload = _extract_phrase_payload(line, i)
+            if payload is None:
+                continue
+            key = (payload["phrase"], payload["keywords"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(payload)
     return uniq
 
 # ---------------- vLLM 本地嵌入封装 ----------------
@@ -263,7 +287,13 @@ def main():
     with io.open(tmp_path, "w", encoding="utf-8") as out:
         idx = 0
         for chunk in batched(error_types, BATCH_SIZE):
-            vecs = embedder.get_embeddings_batch(chunk)
+            phrase_texts = [item["phrase"] for item in chunk]
+            keywords_texts = [item["keywords"] for item in chunk]
+
+            phrase_vecs = embedder.get_embeddings_batch(phrase_texts)
+            keywords_vecs = embedder.get_embeddings_batch(keywords_texts)
+            vecs = torch.cat([phrase_vecs, keywords_vecs], dim=1)
+
             if NORMALIZE:
                 vecs = l2_normalize(vecs)
 
@@ -271,11 +301,11 @@ def main():
                 dim_captured = int(vecs.size(1))
                 print(f"[INFO] 嵌入维度 dim={dim_captured}")
 
-            for label, vec in zip(chunk, vecs):
+            for item, vec in zip(chunk, vecs):
                 idx += 1
                 rec = {
                     "idx": idx,
-                    "错误类型": label,
+                    "phrase": item["phrase"],
                     "dim": dim_captured,
                     "embedding": [float(x) for x in vec.cpu().tolist()]
                 }
