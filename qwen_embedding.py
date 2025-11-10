@@ -67,54 +67,38 @@ import io
 import json
 from typing import List
 
-def load_error_types(paths: List[str]) -> List[str]:
-    # 1) JSONL
+def load_error_types(paths: List[str]) -> List[Dict[str, str]]:
     for p in paths:
         if not os.path.exists(p):
             continue
-        if p.endswith(".jsonl"):
-            all_errors = []  # 不去重，保留所有错误类型
-            any_parsed = False
-            with io.open(p, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        any_parsed = True
-                    except json.JSONDecodeError:
-                        print(f"[WARN] 第 {i} 行 JSON 解析失败，已跳过。")
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    # 主字段
-                    for key in ("错误类型", "error_type", "类型"):
-                        if key in obj and isinstance(obj[key], str):
-                            all_errors.append(obj[key])
-                            break
-                    # 嵌套列表
-                    for err in _iter_llm_errors(obj):
-                        for key in ("错误类型", "error_type", "类型"):
-                            if key in err and isinstance(err[key], str):
-                                all_errors.append(err[key])
-                                break
-            if any_parsed:
-                return all_errors  # 不去重，直接返回所有数据
-
-    # 2) 纯文本（每行一个）
-    for p in paths:
-        if os.path.exists(p) and p.endswith(".txt"):
-            with io.open(p, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            return lines  # 不去重，直接返回所有数据
+        samples: List[Dict[str, str]] = []
+        any_parsed = False
+        with io.open(p, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    any_parsed = True
+                except json.JSONDecodeError:
+                    print(f"[WARN] 第 {i} 行 JSON 解析失败，已跳过。")
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                error_text = obj.get("error")
+                concept_text = obj.get("concept")
+                if isinstance(error_text, str) and isinstance(concept_text, str):
+                    samples.append({"error": error_text, "concept": concept_text})
+        if any_parsed and samples:
+            return samples
 
     raise FileNotFoundError(f"未找到可用输入文件：{paths}")
 
 
 # ---------------- 数据集 ----------------
 class TextDataset(Dataset):
-    def __init__(self, texts: List[str], tokenizer, max_length: int = 64):
+    def __init__(self, texts: List[Dict[str, str]], tokenizer, max_length: int = 64):
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -123,17 +107,36 @@ class TextDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx: int):
-        text = self.texts[idx]
-        enc = self.tokenizer(
-            text,
+        sample = self.texts[idx]
+        error_text = sample["error"]
+        concept_text = sample["concept"]
+
+        error_enc = self.tokenizer(
+            error_text,
             truncation=True,
             padding="max_length",
             max_length=self.max_length,
             return_tensors="pt"
         )
-        # 去掉 batch 维
-        item = {k: v.squeeze(0) for k, v in enc.items()}
-        item["text"] = text
+        concept_enc = self.tokenizer(
+            concept_text,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+
+        item = {
+            "error_input_ids": error_enc["input_ids"].squeeze(0),
+            "error_attention_mask": error_enc["attention_mask"].squeeze(0),
+            "concept_input_ids": concept_enc["input_ids"].squeeze(0),
+            "concept_attention_mask": concept_enc["attention_mask"].squeeze(0),
+            "error_text": error_text,
+        }
+        if "token_type_ids" in error_enc:
+            item["error_token_type_ids"] = error_enc["token_type_ids"].squeeze(0)
+        if "token_type_ids" in concept_enc:
+            item["concept_token_type_ids"] = concept_enc["token_type_ids"].squeeze(0)
         return item
 
 # ---------------- 模型封装 ----------------
@@ -203,7 +206,7 @@ def main():
     if not texts:
         print("[WARN] 输入为空。")
         return
-    print(f"[INFO] 去重后错误类型数：{len(texts)}")
+    print(f"[INFO] 输入样本数：{len(texts)}")
 
     # 2) 初始化
     embedder = AlbertEmbedder(MODEL_PATH)
@@ -219,10 +222,13 @@ def main():
         drop_last=False,
         collate_fn=lambda batch: {
             # 把若干样本堆叠成批
-            "input_ids": torch.stack([it["input_ids"] for it in batch], dim=0),
-            "attention_mask": torch.stack([it["attention_mask"] for it in batch], dim=0),
-            **({"token_type_ids": torch.stack([it["token_type_ids"] for it in batch], dim=0)} if "token_type_ids" in batch[0] else {}),
-            "texts": [it["text"] for it in batch],
+            "error_input_ids": torch.stack([it["error_input_ids"] for it in batch], dim=0),
+            "error_attention_mask": torch.stack([it["error_attention_mask"] for it in batch], dim=0),
+            **({"error_token_type_ids": torch.stack([it["error_token_type_ids"] for it in batch], dim=0)} if "error_token_type_ids" in batch[0] else {}),
+            "concept_input_ids": torch.stack([it["concept_input_ids"] for it in batch], dim=0),
+            "concept_attention_mask": torch.stack([it["concept_attention_mask"] for it in batch], dim=0),
+            **({"concept_token_type_ids": torch.stack([it["concept_token_type_ids"] for it in batch], dim=0)} if "concept_token_type_ids" in batch[0] else {}),
+            "error_texts": [it["error_text"] for it in batch],
         },
     )
 
@@ -233,22 +239,37 @@ def main():
     t0 = time.time()
     with io.open(OUT_PATH, "w", encoding="utf-8") as out:
         for batch in tqdm(loader, desc="生成文本嵌入"):
-            enc_batch = {k: v for k, v in batch.items() if k in ("input_ids", "attention_mask", "token_type_ids")}
-            vecs = embedder.encode_batch(enc_batch, pooling=POOLING, use_fp16=USE_FP16)
-            vecs = l2_normalize(vecs)  # 和你之前一致，做 L2 归一化
+            error_enc_batch = {
+                "input_ids": batch["error_input_ids"],
+                "attention_mask": batch["error_attention_mask"],
+            }
+            if "error_token_type_ids" in batch:
+                error_enc_batch["token_type_ids"] = batch["error_token_type_ids"]
 
-            for text, vec in zip(batch["texts"], vecs):
+            concept_enc_batch = {
+                "input_ids": batch["concept_input_ids"],
+                "attention_mask": batch["concept_attention_mask"],
+            }
+            if "concept_token_type_ids" in batch:
+                concept_enc_batch["token_type_ids"] = batch["concept_token_type_ids"]
+
+            error_vecs = embedder.encode_batch(error_enc_batch, pooling=POOLING, use_fp16=USE_FP16)
+            concept_vecs = embedder.encode_batch(concept_enc_batch, pooling=POOLING, use_fp16=USE_FP16)
+
+            final_vecs = torch.cat([error_vecs, concept_vecs], dim=1)
+            final_vecs = l2_normalize(final_vecs)
+
+            for text, vec in zip(batch["error_texts"], final_vecs):
                 idx += 1
                 rec = {
                     "idx": idx,
-                    "错误类型": text,
-                    "dim": embedder.hidden_size,
+                    "error": text,
                     "embedding": [float(x) for x in vec.tolist()],
                 }
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
             # 释放显存
-            del enc_batch, vecs
+            del error_enc_batch, concept_enc_batch, error_vecs, concept_vecs, final_vecs
             torch.cuda.empty_cache()
 
     dt = time.time() - t0
