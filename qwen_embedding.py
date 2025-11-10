@@ -67,54 +67,56 @@ import io
 import json
 from typing import List
 
-def load_error_types(paths: List[str]) -> List[str]:
-    # 1) JSONL
+def load_error_types(paths: List[str]) -> List[Dict[str, str]]:
     for p in paths:
         if not os.path.exists(p):
             continue
-        if p.endswith(".jsonl"):
-            all_errors = []  # 不去重，保留所有错误类型
-            any_parsed = False
-            with io.open(p, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        any_parsed = True
-                    except json.JSONDecodeError:
-                        print(f"[WARN] 第 {i} 行 JSON 解析失败，已跳过。")
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    # 主字段
-                    for key in ("错误类型", "error_type", "类型"):
-                        if key in obj and isinstance(obj[key], str):
-                            all_errors.append(obj[key])
-                            break
-                    # 嵌套列表
-                    for err in _iter_llm_errors(obj):
-                        for key in ("错误类型", "error_type", "类型"):
-                            if key in err and isinstance(err[key], str):
-                                all_errors.append(err[key])
-                                break
-            if any_parsed:
-                return all_errors  # 不去重，直接返回所有数据
-
-    # 2) 纯文本（每行一个）
-    for p in paths:
-        if os.path.exists(p) and p.endswith(".txt"):
-            with io.open(p, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            return lines  # 不去重，直接返回所有数据
+        samples: List[Dict[str, str]] = []
+        any_parsed = False
+        with io.open(p, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    any_parsed = True
+                except json.JSONDecodeError:
+                    print(f"[WARN] 第 {i} 行 JSON 解析失败，已跳过。")
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                phrase_raw = obj.get("phrase")
+                if not isinstance(phrase_raw, str):
+                    continue
+                try:
+                    phrase_obj = json.loads(phrase_raw)
+                except json.JSONDecodeError:
+                    print(f"[WARN] 第 {i} 行 内部 JSON 解析失败，已跳过。")
+                    continue
+                if not isinstance(phrase_obj, dict):
+                    continue
+                phrase_text = phrase_obj.get("phrase")
+                keywords_val = phrase_obj.get("keywords")
+                if not isinstance(phrase_text, str):
+                    continue
+                keyword_text: Optional[str] = None
+                if isinstance(keywords_val, list) and keywords_val:
+                    first_kw = keywords_val[0]
+                    if isinstance(first_kw, str):
+                        keyword_text = first_kw
+                if keyword_text is None:
+                    continue
+                samples.append({"phrase": phrase_text, "keywords": keyword_text})
+        if any_parsed and samples:
+            return samples
 
     raise FileNotFoundError(f"未找到可用输入文件：{paths}")
 
 
 # ---------------- 数据集 ----------------
 class TextDataset(Dataset):
-    def __init__(self, texts: List[str], tokenizer, max_length: int = 64):
+    def __init__(self, texts: List[Dict[str, str]], tokenizer, max_length: int = 64):
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -123,17 +125,36 @@ class TextDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx: int):
-        text = self.texts[idx]
-        enc = self.tokenizer(
-            text,
+        sample = self.texts[idx]
+        phrase_text = sample["phrase"]
+        keywords_text = sample["keywords"]
+
+        phrase_enc = self.tokenizer(
+            phrase_text,
             truncation=True,
             padding="max_length",
             max_length=self.max_length,
             return_tensors="pt"
         )
-        # 去掉 batch 维
-        item = {k: v.squeeze(0) for k, v in enc.items()}
-        item["text"] = text
+        keywords_enc = self.tokenizer(
+            keywords_text,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+
+        item = {
+            "phrase_input_ids": phrase_enc["input_ids"].squeeze(0),
+            "phrase_attention_mask": phrase_enc["attention_mask"].squeeze(0),
+            "keywords_input_ids": keywords_enc["input_ids"].squeeze(0),
+            "keywords_attention_mask": keywords_enc["attention_mask"].squeeze(0),
+            "phrase_text": phrase_text,
+        }
+        if "token_type_ids" in phrase_enc:
+            item["phrase_token_type_ids"] = phrase_enc["token_type_ids"].squeeze(0)
+        if "token_type_ids" in keywords_enc:
+            item["keywords_token_type_ids"] = keywords_enc["token_type_ids"].squeeze(0)
         return item
 
 # ---------------- 模型封装 ----------------
@@ -203,7 +224,7 @@ def main():
     if not texts:
         print("[WARN] 输入为空。")
         return
-    print(f"[INFO] 去重后错误类型数：{len(texts)}")
+    print(f"[INFO] 输入样本数：{len(texts)}")
 
     # 2) 初始化
     embedder = AlbertEmbedder(MODEL_PATH)
@@ -219,10 +240,13 @@ def main():
         drop_last=False,
         collate_fn=lambda batch: {
             # 把若干样本堆叠成批
-            "input_ids": torch.stack([it["input_ids"] for it in batch], dim=0),
-            "attention_mask": torch.stack([it["attention_mask"] for it in batch], dim=0),
-            **({"token_type_ids": torch.stack([it["token_type_ids"] for it in batch], dim=0)} if "token_type_ids" in batch[0] else {}),
-            "texts": [it["text"] for it in batch],
+            "phrase_input_ids": torch.stack([it["phrase_input_ids"] for it in batch], dim=0),
+            "phrase_attention_mask": torch.stack([it["phrase_attention_mask"] for it in batch], dim=0),
+            **({"phrase_token_type_ids": torch.stack([it["phrase_token_type_ids"] for it in batch], dim=0)} if "phrase_token_type_ids" in batch[0] else {}),
+            "keywords_input_ids": torch.stack([it["keywords_input_ids"] for it in batch], dim=0),
+            "keywords_attention_mask": torch.stack([it["keywords_attention_mask"] for it in batch], dim=0),
+            **({"keywords_token_type_ids": torch.stack([it["keywords_token_type_ids"] for it in batch], dim=0)} if "keywords_token_type_ids" in batch[0] else {}),
+            "phrase_texts": [it["phrase_text"] for it in batch],
         },
     )
 
@@ -233,22 +257,37 @@ def main():
     t0 = time.time()
     with io.open(OUT_PATH, "w", encoding="utf-8") as out:
         for batch in tqdm(loader, desc="生成文本嵌入"):
-            enc_batch = {k: v for k, v in batch.items() if k in ("input_ids", "attention_mask", "token_type_ids")}
-            vecs = embedder.encode_batch(enc_batch, pooling=POOLING, use_fp16=USE_FP16)
-            vecs = l2_normalize(vecs)  # 和你之前一致，做 L2 归一化
+            phrase_enc_batch = {
+                "input_ids": batch["phrase_input_ids"],
+                "attention_mask": batch["phrase_attention_mask"],
+            }
+            if "phrase_token_type_ids" in batch:
+                phrase_enc_batch["token_type_ids"] = batch["phrase_token_type_ids"]
 
-            for text, vec in zip(batch["texts"], vecs):
+            keywords_enc_batch = {
+                "input_ids": batch["keywords_input_ids"],
+                "attention_mask": batch["keywords_attention_mask"],
+            }
+            if "keywords_token_type_ids" in batch:
+                keywords_enc_batch["token_type_ids"] = batch["keywords_token_type_ids"]
+
+            phrase_vecs = embedder.encode_batch(phrase_enc_batch, pooling=POOLING, use_fp16=USE_FP16)
+            keywords_vecs = embedder.encode_batch(keywords_enc_batch, pooling=POOLING, use_fp16=USE_FP16)
+
+            final_vecs = torch.cat([phrase_vecs, keywords_vecs], dim=1)
+            final_vecs = l2_normalize(final_vecs)
+
+            for text, vec in zip(batch["phrase_texts"], final_vecs):
                 idx += 1
                 rec = {
                     "idx": idx,
-                    "错误类型": text,
-                    "dim": embedder.hidden_size,
+                    "phrase": text,
                     "embedding": [float(x) for x in vec.tolist()],
                 }
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
             # 释放显存
-            del enc_batch, vecs
+            del phrase_enc_batch, keywords_enc_batch, phrase_vecs, keywords_vecs, final_vecs
             torch.cuda.empty_cache()
 
     dt = time.time() - t0
